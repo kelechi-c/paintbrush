@@ -333,6 +333,7 @@ class Unet(nnx.Module):
             x = upsample_block(x)
 
         x = jnp.concat([x, res], axis=1)
+        x = self.finres_transform(x)
         x = self.final_resblock(x, t)
         x = self.final_conv(x)
 
