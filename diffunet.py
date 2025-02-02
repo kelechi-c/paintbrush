@@ -213,17 +213,7 @@ class TimeMLP(nnx.Module):
         x = self.lin_2(nnx.gelu(x))
 
         return x
-    
-class Block(nnx.Module):
-    def __init__(self, dim_in, dim_out, attn_heads, attn_head_dim, is_full=None):
-        self.resconv_1 = ResBlock(dim_in, dim_in)
-        self.resconv_2 = ResBlock(dim_in, dim_in)
-        self.attn = nnx.MultiHeadAttention(attn_heads, dim_in, out_features=dim_out, decode=False)
 
-    def __call__(self, x, t=None):
-        x = self.resconv_1(x, t)
-        
-        
 
 def cast_tuple(t, length=1):
     return t if isinstance(t, tuple) else ((t,) * length)
@@ -235,13 +225,12 @@ class Unet(nnx.Module):
         dim, init_dim=None, out_dim=None, 
         dim_mults=(1, 2, 4, 8), channels=4,
         learn_var=False,
-        learned_sinusoid_dim=16,
         sinusoid_theta=10_000,
         drop=0.0, attn_head_dim=32, attn_heads=4,
         full_attn=None, num_res_stream=2
     ):
         super().__init__()
-        
+
         self.channels = channels
         init_dim = init_dim or dim
         self.init_conv = nnx.Conv(
@@ -249,57 +238,56 @@ class Unet(nnx.Module):
             kernel_size=(7, 7),
             padding=3
         )
-        
+
         dims = [init_dim, *map(lambda m: dim*m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
         print(f'{dims = } / {in_out = }')
-        
+
         time_dim = dim * 4
-        
+
         sinusoid_posembed = SinusoidPosEmbedding(dim, theta=sinusoid_theta)
         fourier_dim = dim
-        
+
         self.time_mlp = TimeMLP(time_dim, fourier_dim, sinusoid_posembed)
-        
+        self.label_embed = LabelEmbedder(102, dim)
+
         num_stages = len(dim_mults)
         full_attn = cast_tuple(full_attn, num_stages)
         attn_heads = cast_tuple(attn_heads, num_stages)
         attn_head_dim = cast_tuple(attn_head_dim, num_stages)
-        
+
         block_args = (in_out, full_attn, attn_heads, attn_head_dim)
-        
+
         assert len(full_attn) == len(dim_mults), 'full_attn must match num of mulipliers'
-        
+
         # FullAttn = partial(Attention, flash=False)
         resnet_block = partial(ResBlock, time_dim=time_dim, drop=drop)
-        
+
         res_conv = partial(nnx.Conv, kernel_size=(1, 1), use_bias=False)
-        
+
         self.downs = []
         self.ups = []
         num_resolutions = len(in_out)
-        
+
         for idx, ((dim_in, dim_out), layer_attn, layer_heads, layer_head_dim) in enumerate(zip(block_args)):
             is_last = idx >= (num_resolutions-1)
-            
+
             attn_block = Attention if layer_attn else LinearAttention
-            
+
             self.downs.append([
                 resnet_block(dim_in, dim_in), resnet_block(dim_in, dim_in), 
                 attn_block(dim_in, layer_heads, layer_head_dim),
                 downsample(dim_in, dim_out) if not is_last else nnx.Conv(dim_in, dim_out, (3,3), padding=1)
             ])
-            
+
         mid_dim = dims[-1]
-        self.mid_block = nnx.Sequential(
-            ResBlock(mid_dim, mid_dim, time_dim=time_dim),
-            Attention(mid_dim, attn_heads[-1], attn_head_dim[-1]),
-            ResBlock(mid_dim, mid_dim)
-        )
-        
+        self.mid_block_1 = ResBlock(mid_dim, mid_dim, time_dim=time_dim)
+        self.mid_attention = Attention(mid_dim, attn_heads[-1], attn_head_dim[-1])
+        self.mid_block_2 = ResBlock(mid_dim, mid_dim)
+
         for idx, ((dim_in, dim_out), layer_attn, layer_heads, layer_head_dim) in enumerate(zip(*map(reversed, block_args))):
             is_last = idx == (len(in_out) - 1)
-            
+
             attn_block = Attention if layer_attn else LinearAttention
 
             self.ups.append([
@@ -308,13 +296,103 @@ class Unet(nnx.Module):
                 attn_block(dim_out, layer_heads, layer_head_dim),
                 upsample(dim_out, dim_in)
             ])
-            
+
         default_out_dim = channels * (1 if not learn_var else 2)
         self.out_dim = out_dim or default_out_dim
-        
+
+        self.finres_transform = res_conv(init_dim*2, init_dim)
         self.final_resblock = ResBlock(init_dim*2, init_dim)
         self.final_conv = nnx.Conv(init_dim, self.out_dim, kernel_size=(1, 1))
-    
-    
-    def __call__(self, x, t, y):
-        
+
+    def __call__(self, x: Array, t: Array, y: Array):
+        x = self.init_conv(x)
+        res = x
+        h_skips = []
+
+        y = self.label_embed(y)
+        t = self.time_mlp(t) + y
+
+        for block1, block2, attn, downsampler in self.downs:
+            x = block1(x, t)
+            h_skips.append(x)
+
+            x = attn(block2(x, t))
+            h_skips.append(x)
+            x = downsampler(x)
+
+        x = self.mid_block_1(x, t)
+        x = self.mid_attention(x)
+        x = self.mid_block_2(x, t)
+
+        for block1, block2, attn, upsample_block in self.ups:
+            x = jnp.concat([x, h_skips.pop()], axis=1)
+            x = block1(x, t)
+            x = jnp.concat([x, h_skips.pop()], axis=1)
+            x = attn(block2(x, t))
+            x = upsample_block(x)
+
+        x = jnp.concat([x, res], axis=1)
+        x = self.final_resblock(x, t)
+        x = self.final_conv(x)
+
+        return x
+
+
+# wrapper for flow matching loss and sampling
+class FlowWrapper(nnx.Module):
+    def __init__(self, model: Unet):
+        self.model = model
+
+    def __call__(self, x: Array, c: Array) -> Array:
+        img_latents, cond = x, c
+
+        x_1, c = img_latents, cond  # reassign to more concise variables
+        bs = x_1.shape[0]
+
+        x_0 = jrand.normal(randkey, x_1.shape)  # noise
+        t = jrand.uniform(randkey, (bs,))
+        t = nnx.sigmoid(t)
+
+        inshape = [1] * len(x_1.shape[1:])
+        t_exp = t.reshape([bs, *(inshape)])
+
+        x_t = (1 - t_exp) * x_0 + t_exp * x_1
+        dx_t = x_1 - x_0  # actual vector/velocity difference
+
+        vtheta = self.model(
+            x_t, t, c, mask_ratio=self.mask_ratio
+        )  # model vector prediction
+
+        mean_dim = list(
+            range(1, len(x_1.shape))
+        )  # across all dimensions except the batch dim
+        mean_square = (dx_t - vtheta) ** 2  # squared difference/error
+        batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
+        loss = jnp.mean(batchwise_mse_loss)
+
+        return loss.mean()
+
+    def flow_step(self, x_t: Array, cond: Array, t_start: float, t_end: float) -> Array:
+        """Performs a single flow step using Euler's method."""
+        t_mid = (t_start + t_end) / 2.0
+        # Broadcast t_mid to match x_t's batch dimension
+        t_mid = jnp.full((x_t.shape[0],), t_mid)
+        # Evaluate the vector field at the midpoint
+        v_mid, _ = self.model(x=x_t, y=cond, t=t_mid)
+        # Update x_t using Euler's method
+        x_t_next = x_t + (t_end - t_start) * v_mid
+
+        return x_t_next
+
+    def sample(self, label: Array, num_steps: int = 50):
+        """Generates samples using flow matching."""
+        time_steps = jnp.linspace(0.0, 1.0, num_steps + 1)
+        x_t = jax.random.normal(randkey, (len(label), 32, 32, 4))  # important change
+
+        for k in tqdm(range(num_steps), desc="Sampling images"):
+            x_t = self.flow_step(
+                x_t=x_t, cond=label, t_start=time_steps[k], t_end=time_steps[k + 1]
+            )
+            
+
+        return x_t / 0.13025
