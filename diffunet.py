@@ -10,6 +10,7 @@ from einops.layers.flax import Rearrange
 from functools import partial
 
 rngs = nnx.Rngs(333)
+randkey = jrand.key(333)
 
 class RMSNorm(nnx.Module):
     def __init__(self, dim):
@@ -33,6 +34,39 @@ class SinusoidPosEmbedding(nnx.Module):
         emb = x * emb
         emb = jnp.concatenate([emb.sin(), emb.cos()], axis=-1)
         return emb
+
+
+class LabelEmbedder(nnx.Module):
+    def __init__(self, num_classes, hidden_size, drop):
+        super().__init__()
+        use_cfg_embeddings = drop > 0
+        self.embedding_table = nnx.Embed(
+            num_classes + int(use_cfg_embeddings),
+            hidden_size,
+            rngs=rngs,
+            embedding_init=nnx.initializers.normal(0.02),
+        )
+        self.num_classes = num_classes
+        self.dropout = drop
+
+    def token_drop(self, labels, force_drop_ids=None) -> Array:
+        if force_drop_ids is None:
+            drop_ids = jrand.normal(key=randkey, shape=labels.shape[0])
+        else:
+            drop_ids = force_drop_ids == 1
+
+        labels = jnp.where(drop_ids, self.num_classes, labels)
+
+        return labels
+
+    def __call__(self, labels, train: bool = True, force_drop_ids=None) -> Array:
+        use_drop = self.dropout > 0
+        if (train and use_drop) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+
+        label_embeds = self.embedding_table(labels)
+
+        return label_embeds
 
 class Interpolate(nnx.Module):
     def __init__(self, scale_factor=2):
@@ -93,7 +127,7 @@ class ResBlock(nnx.Module):
         
         h = self.block_2(h)
         
-        return h
+        return h + x
 
 
 class LinearAttention(nnx.Module):
@@ -179,7 +213,17 @@ class TimeMLP(nnx.Module):
         x = self.lin_2(nnx.gelu(x))
 
         return x
+    
+class Block(nnx.Module):
+    def __init__(self, dim_in, dim_out, attn_heads, attn_head_dim, is_full=None):
+        self.resconv_1 = ResBlock(dim_in, dim_in)
+        self.resconv_2 = ResBlock(dim_in, dim_in)
+        self.attn = nnx.MultiHeadAttention(attn_heads, dim_in, out_features=dim_out, decode=False)
 
+    def __call__(self, x, t=None):
+        x = self.resconv_1(x, t)
+        
+        
 
 def cast_tuple(t, length=1):
     return t if isinstance(t, tuple) else ((t,) * length)
@@ -222,9 +266,11 @@ class Unet(nnx.Module):
         attn_heads = cast_tuple(attn_heads, num_stages)
         attn_head_dim = cast_tuple(attn_head_dim, num_stages)
         
+        block_args = (in_out, full_attn, attn_heads, attn_head_dim)
+        
         assert len(full_attn) == len(dim_mults), 'full_attn must match num of mulipliers'
         
-        FullAttn = partial(Attention, flash=False)
+        # FullAttn = partial(Attention, flash=False)
         resnet_block = partial(ResBlock, time_dim=time_dim, drop=drop)
         
         res_conv = partial(nnx.Conv, kernel_size=(1, 1), use_bias=False)
@@ -232,4 +278,43 @@ class Unet(nnx.Module):
         self.downs = []
         self.ups = []
         num_resolutions = len(in_out)
+        
+        for idx, ((dim_in, dim_out), layer_attn, layer_heads, layer_head_dim) in enumerate(zip(block_args)):
+            is_last = idx >= (num_resolutions-1)
+            
+            attn_block = Attention if layer_attn else LinearAttention
+            
+            self.downs.append([
+                resnet_block(dim_in, dim_in), resnet_block(dim_in, dim_in), 
+                attn_block(dim_in, layer_heads, layer_head_dim),
+                downsample(dim_in, dim_out) if not is_last else nnx.Conv(dim_in, dim_out, (3,3), padding=1)
+            ])
+            
+        mid_dim = dims[-1]
+        self.mid_block = nnx.Sequential(
+            ResBlock(mid_dim, mid_dim, time_dim=time_dim),
+            Attention(mid_dim, attn_heads[-1], attn_head_dim[-1]),
+            ResBlock(mid_dim, mid_dim)
+        )
+        
+        for idx, ((dim_in, dim_out), layer_attn, layer_heads, layer_head_dim) in enumerate(zip(*map(reversed, block_args))):
+            is_last = idx == (len(in_out) - 1)
+            
+            attn_block = Attention if layer_attn else LinearAttention
+
+            self.ups.append([
+                ResBlock(dim_out+dim_in, dim_out),
+                ResBlock(dim_out+dim_in, dim_out),
+                attn_block(dim_out, layer_heads, layer_head_dim),
+                upsample(dim_out, dim_in)
+            ])
+            
+        default_out_dim = channels * (1 if not learn_var else 2)
+        self.out_dim = out_dim or default_out_dim
+        
+        self.final_resblock = ResBlock(init_dim*2, init_dim)
+        self.final_conv = nnx.Conv(init_dim, self.out_dim, kernel_size=(1, 1))
+    
+    
+    def __call__(self, x, t, y):
         
