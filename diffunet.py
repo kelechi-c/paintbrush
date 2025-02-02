@@ -2,12 +2,13 @@
 Diffusion U-Net in JAX. adapted from https://github.com/lucidrains/rectified-flow-pytorch
 """
 
-import jax, flax, einops
+import jax
 from jax import Array, numpy as jnp, random as jrand
 from flax import nnx
 from einops import rearrange, repeat
 from einops.layers.flax import Rearrange
 from functools import partial
+from tqdm.auto import tqdm
 
 rngs = nnx.Rngs(333)
 randkey = jrand.key(333)
@@ -339,7 +340,7 @@ class Unet(nnx.Module):
 
 
 # wrapper for flow matching loss and sampling
-class FlowWrapper(nnx.Module):
+class FlowMatch(nnx.Module):
     def __init__(self, model: Unet):
         self.model = model
 
@@ -372,17 +373,26 @@ class FlowWrapper(nnx.Module):
 
         return loss.mean()
 
-    def flow_step(self, x_t: Array, cond: Array, t_start: float, t_end: float) -> Array:
+    def flow_step(
+        self, x_t: Array, cond: Array, t_start: float, t_end: float, cfg_scale=2.0
+    ) -> Array:
         """Performs a single flow step using Euler's method."""
         t_mid = (t_start + t_end) / 2.0
         # Broadcast t_mid to match x_t's batch dimension
         t_mid = jnp.full((x_t.shape[0],), t_mid)
         # Evaluate the vector field at the midpoint
-        v_mid, _ = self.model(x=x_t, y=cond, t=t_mid)
+        v_mid = self.model(x=x_t, y=cond, t=t_mid)
+
+        # classifier-free guidance sampling
+        null_cond = jnp.zeros_like(cond)
+        v_uncond = self.model(x_t, null_cond, t_mid)
+        v_mid = v_uncond + cfg_scale * (v_mid - v_uncond)
+
         # Update x_t using Euler's method
         x_t_next = x_t + (t_end - t_start) * v_mid
 
         return x_t_next
+
 
     def sample(self, label: Array, num_steps: int = 50):
         """Generates samples using flow matching."""
@@ -393,6 +403,5 @@ class FlowWrapper(nnx.Module):
             x_t = self.flow_step(
                 x_t=x_t, cond=label, t_start=time_steps[k], t_end=time_steps[k + 1]
             )
-            
 
         return x_t / 0.13025
