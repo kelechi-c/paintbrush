@@ -133,7 +133,7 @@ class LinearAttention(nnx.Module):
 
 
 class Attention(nnx.Module):
-    def __init__(self, dim, heads=4, head_dim=32, num_mem_kv=4):
+    def __init__(self, dim, heads=4, head_dim=32, num_mem_kv=4, flash=False):
         super().__init__()
         self.scale = head_dim ** -0.5
         self.heads = heads 
@@ -166,3 +166,70 @@ class Attention(nnx.Module):
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', h = self.heads, x = h, y = w)
 
         return self.out_project(out)
+
+class TimeMLP(nnx.Module):
+    def __init__(self, time_dim, fourier_dim, sinusoid_emb):
+        super().__init__()
+        self.lin_1 = nnx.Linear(fourier_dim, time_dim, rngs=rngs)
+        self.sinusoid_embed = sinusoid_emb
+        self.lin_2 = nnx.Linear(time_dim, time_dim)
+
+    def __call__(self, x):
+        x = self.lin_1(self.sinusoid_embed(x))
+        x = self.lin_2(nnx.gelu(x))
+
+        return x
+
+
+def cast_tuple(t, length=1):
+    return t if isinstance(t, tuple) else ((t,) * length)
+
+# denoising U-Net model
+class Unet(nnx.Module):
+    def __init__(
+        self, 
+        dim, init_dim=None, out_dim=None, 
+        dim_mults=(1, 2, 4, 8), channels=4,
+        learn_var=False,
+        learned_sinusoid_dim=16,
+        sinusoid_theta=10_000,
+        drop=0.0, attn_head_dim=32, attn_heads=4,
+        full_attn=None, num_res_stream=2
+    ):
+        super().__init__()
+        
+        self.channels = channels
+        init_dim = init_dim or dim
+        self.init_conv = nnx.Conv(
+            channels, init_dim,
+            kernel_size=(7, 7),
+            padding=3
+        )
+        
+        dims = [init_dim, *map(lambda m: dim*m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+        print(f'{dims = } / {in_out = }')
+        
+        time_dim = dim * 4
+        
+        sinusoid_posembed = SinusoidPosEmbedding(dim, theta=sinusoid_theta)
+        fourier_dim = dim
+        
+        self.time_mlp = TimeMLP(time_dim, fourier_dim, sinusoid_posembed)
+        
+        num_stages = len(dim_mults)
+        full_attn = cast_tuple(full_attn, num_stages)
+        attn_heads = cast_tuple(attn_heads, num_stages)
+        attn_head_dim = cast_tuple(attn_head_dim, num_stages)
+        
+        assert len(full_attn) == len(dim_mults), 'full_attn must match num of mulipliers'
+        
+        FullAttn = partial(Attention, flash=False)
+        resnet_block = partial(ResBlock, time_dim=time_dim, drop=drop)
+        
+        res_conv = partial(nnx.Conv, kernel_size=(1, 1), use_bias=False)
+        
+        self.downs = []
+        self.ups = []
+        num_resolutions = len(in_out)
+        
