@@ -63,8 +63,12 @@ print("loaded vae")
 
 
 def jax_collate(batch):
-    latents = jnp.stack([jnp.array(item["latent"]) for item in batch], axis=0)
-    labels = jnp.stack([int(item["label"]) for item in batch], axis=0)
+    latents = jnp.stack(
+        [jnp.array(item["latents"], dtype=jnp.bfloat16) for item in batch], axis=0
+    )
+    labels = jnp.stack(
+        [jnp.array(int(item["label"]), dtype=jnp.int32) for item in batch], axis=0
+    )
 
     return {
         "latent": latents,
@@ -133,14 +137,14 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
 def sample_image_batch(step, model, labels):
     pred_model = device_get_model(model)
     pred_model.eval()
-    
+
     image_batch = pred_model.sample(labels)
     file = f"fmsamples/{step}_flowdit.png"
     batch = [process_img(x) for x in image_batch]
 
     gridfile = image_grid(batch, file)
     print(f"sample saved @ {gridfile}")
-    
+
     model.train()
 
     return gridfile
@@ -154,7 +158,8 @@ def sample_image_batch(step, model, labels):
 def train_step(model, optimizer, batch):
 
     def loss_func(model, batch):
-        img_latents, label = batch['latent'], batch['label']
+        img_latents, label = batch["latent"], batch["label"]
+        img_latents = rearrange(img_latents, "b c h w -> b h w c") * 0.13025
         loss = model(img_latents, label)
 
         return loss
@@ -174,7 +179,7 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
 
     batch = next(iter(train_loader))
 
-    wandb_logger(key="yourkey", project_name="mini_diffusion")
+    # wandb_logger(key="yourkey", project_name="mini_diffusion")
 
     stime = time.time()
 
@@ -212,7 +217,6 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
     return model, train_loss
 
 
-
 @click.command()
 @click.option("-r", "--run", default="single_batch")
 @click.option("-e", "--epochs", default=50)
@@ -235,9 +239,9 @@ def main(run, epochs, batch_size):
     #     power=power,
     #     transition_steps=5000,
     # )
-    
+
     schedule = optax.constant_schedule(2e-4)
-    
+
     optimizer = nnx.Optimizer(
         model,
         optax.adamw(schedule, b1=0.9, b2=0.995, eps=1e-8, weight_decay=0.001),
@@ -248,23 +252,26 @@ def main(run, epochs, batch_size):
     train_loader = DataLoader(
         flower_data,
         batch_size=batch_size,
-        num_workers=num_devices,
+        num_workers=0,
         drop_last=True,
         collate_fn=jax_collate,
     )
 
     sp = next(iter(train_loader))
-    print(f"loaded data \n data sample: {sp['vae_output'].shape}")
+    print(f"loaded data \n data sample: {sp['latent'].shape}")
 
     if run == "single_batch":
         model, loss = batch_trainer(
-            epochs, model=model, optimizer=optimizer, train_loader=train_loader
+            epochs,
+            model=model,
+            optimizer=optimizer,
+            train_loader=train_loader,
+            schedule=schedule,
         )
         wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
 
     elif run == "train":
         print(f"you missed your train looop impl boy")
-
 
 main()
