@@ -13,8 +13,11 @@ from tqdm.auto import tqdm
 rngs = nnx.Rngs(333)
 randkey = jrand.key(333)
 
-rngs = nnx.Rngs(333)
-randkey = jrand.key(333)
+xavier_init = nnx.initializers.xavier_uniform()
+zero_init = nnx.initializers.constant(0)
+one_init = nnx.initializers.constant(1)
+normal_init = nnx.initializers.normal(0.02)
+trunc_init = nnx.initializers.truncated_normal(0.02)
 
 
 class RMSNorm(nnx.Module):
@@ -89,33 +92,21 @@ class Interpolate(nnx.Module):
         self.scale_factor = scale_factor
 
     def __call__(self, x: Array) -> Array:
-        shape = (
-            x.shape[0],
-            x.shape[1] * self.scale_factor,
-            x.shape[2] * self.scale_factor,
-            x.shape[3],
-        )
+        shape = (x.shape[0], x.shape[1] * self.scale_factor, x.shape[2] * self.scale_factor, x.shape[3])
         x = jax.image.resize(x, shape=shape, method="nearest")
         # print(f'interpolated {x.shape}')
         return x
 
-
-def upsample(dim, dim_out=None):
+def upsample(dim, dim_out = None):
     return nnx.Sequential(
         Interpolate(),
-        nnx.Conv(dim, dim_out or dim, kernel_size=(3, 3), rngs=rngs),
+        nnx.Conv(dim, dim_out or dim, kernel_size=(3, 3), rngs=rngs, kernel_init=zero_init, bias_init=zero_init),
     )
 
-
-# def downsample(dim, dim_out = None):
-#     return nnx.Sequential(
-#         Rearrange('b (h 2) (w 2) c -> b h w (c 2 2)'),
-#         nnx.Conv(dim * 4, dim_out or dim, kernel_size=(1, 1), rngs=rngs)
-#     )
 class downsample(nnx.Module):
     def __init__(self, dim, dim_out):
         super().__init__()
-        self.conv = nnx.Conv(dim * 4, dim_out or dim, kernel_size=(1, 1), rngs=rngs)
+        self.conv = nnx.Conv(dim * 4, dim_out or dim, kernel_size=(1, 1), rngs=rngs, kernel_init=zero_init, bias_init=zero_init)
 
     def __call__(self, x: Array) -> Array:
         x = rearrange(x, "b (h p1) (w p2) c -> b h w (c p1 p2)", p1=2, p2=2)
@@ -127,7 +118,14 @@ class downsample(nnx.Module):
 class ConvBlock(nnx.Module):
     def __init__(self, dim, dim_out, drop=0.0):
         super().__init__()
-        self.project = nnx.Conv(dim, dim_out, kernel_size=(3, 3), rngs=rngs)
+        self.project = nnx.Conv(
+            dim,
+            dim_out,
+            kernel_size=(3, 3),
+            rngs=rngs,
+            kernel_init=zero_init,
+            bias_init=zero_init,
+        )
         self.norm = RMSNorm(dim_out)
         self.droplayer = nnx.Dropout(drop, rngs=rngs)
 
@@ -147,7 +145,7 @@ class ConvBlock(nnx.Module):
 class ResBlock(nnx.Module):
     def __init__(self, dim, dim_out, *, time_dim=None, drop=0.0, is_res=True):
         super().__init__()
-        self.mlp = nnx.Linear(time_dim, dim_out * 2, rngs=rngs) if time_dim else None
+        self.mlp = nnx.Linear(time_dim, dim_out*2, rngs=rngs, kernel_init=zero_init, bias_init=zero_init) if time_dim else None
         self.block_1 = ConvBlock(dim, dim_out, drop=drop)
         self.block_2 = ConvBlock(dim_out, dim_out, drop=drop)
         self.isres = is_res
@@ -157,60 +155,15 @@ class ResBlock(nnx.Module):
         res = x
         if self.mlp and time_emb is not None:
             time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, "b c -> b 1 1 c")
+            time_emb = rearrange(time_emb, 'b c -> b 1 1 c')
             scale_shift = jnp.array_split(time_emb, 2, axis=-1)
 
-        h = self.block_1(x, scale_shift=scale_shift)
+        h = self.block_1(x, scale_shift = scale_shift)
 
         h = self.block_2(h)
         # print(f'resblock {h.shape = } / {x.shape = }')
         # print(f'{h.shape = } / {res.shape = }')
         return h + res if self.isres else h
-
-
-class LinearAttention(nnx.Module):
-    def __init__(self, dim, heads=4, head_dim=32, num_mem_kv=4):
-        super().__init__()
-        self.scale = head_dim**-0.5
-        self.heads = heads
-        hidden_dim = head_dim * heads
-        # print(f'{heads = } / {head_dim = } / {hidden_dim = }')
-
-        self.norm = RMSNorm(dim)
-
-        self.mem_kv = nnx.Param(jnp.zeros((2, heads, num_mem_kv, head_dim)))
-        self.qkv_project = nnx.Conv(dim, hidden_dim * 3, kernel_size=(1, 1), rngs=rngs)
-        self.out_project = nnx.Sequential(
-            nnx.Conv(hidden_dim, dim, 1, rngs=rngs), RMSNorm(dim)
-        )
-
-    def __call__(self, x: Array):
-        b, h, w, c = x.shape
-        print(f"linear attn in {x.shape = }")
-
-        x = self.norm(x)
-
-        qkv = self.qkv_project(x)
-        print(f"{qkv.shape = }")
-        qkv = jnp.array_split(qkv, 3, axis=-1)
-
-        q, k, v = map(
-            lambda t: rearrange(t, "b x y (h c) -> b h c (x y)", h=self.heads), qkv
-        )
-        print(f"{q.shape = }")
-
-        # mk, mv = map(lambda t: repeat(t, 'h n d -> b h n d', b = b), self.mem_kv.value)
-        # k, v = map(partial(jnp.concatenate, axis = -2), ((mk, k), (mv, v)))
-        # print(f'linear {k.shape = } / {v.shape = }')
-
-        q = q * self.scale
-        # context = jnp.einsum('bhdn, bhen -> bhde', k, v)
-        # out = jnp.einsum('bhde, bhdn -> bhen', context, q)
-
-        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
-        print(f"linear {out.shape = }")
-
-        return self.out_project(out)
 
 
 class Attention(nnx.Module):
@@ -224,8 +177,22 @@ class Attention(nnx.Module):
         self.norm = RMSNorm(dim)
 
         self.mem_kv = nnx.Param(jnp.zeros((2, heads, num_mem_kv, head_dim)))
-        self.qkv_project = nnx.Conv(dim, hidden_dim * 3, kernel_size=(1, 1), rngs=rngs)
-        self.out_project = nnx.Conv(hidden_dim, dim, (1, 1), rngs=rngs)
+        self.qkv_project = nnx.Conv(
+            dim,
+            hidden_dim * 3,
+            kernel_size=(1, 1),
+            rngs=rngs,
+            kernel_init=zero_init,
+            bias_init=zero_init,
+        )
+        self.out_project = nnx.Conv(
+            hidden_dim,
+            dim,
+            (1, 1),
+            rngs=rngs,
+            kernel_init=zero_init,
+            bias_init=zero_init,
+        )
 
     def __call__(self, x: Array):
         b, h, w, c = x.shape
@@ -259,9 +226,9 @@ class Attention(nnx.Module):
 class TimeMLP(nnx.Module):
     def __init__(self, time_dim, fourier_dim, sinusoid_emb):
         super().__init__()
-        self.lin_1 = nnx.Linear(fourier_dim, time_dim, rngs=rngs)
+        self.lin_1 = nnx.Linear(fourier_dim, time_dim, rngs=rngs, kernel_init=zero_init, bias_init=zero_init)
         self.sinusoid_embed = sinusoid_emb
-        self.lin_2 = nnx.Linear(time_dim, time_dim, rngs=rngs)
+        self.lin_2 = nnx.Linear(time_dim, time_dim, rngs=rngs, kernel_init=zero_init, bias_init=zero_init)
 
     def __call__(self, x):
         x = self.lin_1(self.sinusoid_embed(x))
@@ -274,35 +241,31 @@ class TimeMLP(nnx.Module):
 def cast_tuple(t, length=1):
     return t if isinstance(t, tuple) else ((t,) * length)
 
-
 # denoising U-Net model
 class Unet(nnx.Module):
     def __init__(
         self,
-        dim,
-        init_dim=None,
-        out_dim=None,
-        dim_mults=(1, 2, 4, 8),
-        channels=4,
+        dim, init_dim=None, out_dim=None,
+        dim_mults=(1, 2, 4, 8), channels=4,
         learn_var=False,
         sinusoid_theta=10_000,
-        drop=0.0,
-        attn_head_dim=32,
-        attn_heads=4,
-        full_attn=None,
-        num_res_stream=2,
+        drop=0.0, attn_head_dim=32, attn_heads=4,
+        full_attn=None, num_res_stream=2
     ):
         super().__init__()
 
         self.channels = channels
         init_dim = init_dim or dim
         self.init_conv = nnx.Conv(
-            channels, init_dim, kernel_size=(7, 7), padding=3, rngs=rngs
+            channels, init_dim,
+            kernel_size=(7, 7),
+            padding=3, rngs=rngs,
+            kernel_init=zero_init, bias_init=zero_init
         )
 
-        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        dims = [init_dim, *map(lambda m: dim*m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
-        print(f"{dims = } / {in_out = }")
+        print(f'{dims = } / {in_out = }')
 
         time_dim = dim
 
@@ -319,90 +282,55 @@ class Unet(nnx.Module):
 
         block_args = (in_out, full_attn, attn_heads, attn_head_dim)
 
-        assert len(full_attn) == len(
-            dim_mults
-        ), "full_attn must match num of mulipliers"
+        assert len(full_attn) == len(dim_mults), 'full_attn must match num of mulipliers'
 
         # FullAttn = partial(Attention, flash=False)
         resnet_block = partial(ResBlock, time_dim=time_dim, drop=drop)
 
-        res_conv = partial(nnx.Conv, kernel_size=(1, 1), use_bias=False, rngs=rngs)
-        nnx_attn = partial(
-            nnx.MultiHeadAttention, rngs=rngs, decode=False, dtype=jnp.bfloat16
-        )
+        res_conv = partial(nnx.Conv, kernel_size=(1, 1), use_bias=False, rngs=rngs, kernel_init=zero_init, bias_init=zero_init)
+        nnx_attn = partial(nnx.MultiHeadAttention, rngs=rngs, decode=False, dtype=jnp.bfloat16, kernel_init=zero_init, bias_init=zero_init, out_bias_init=zero_init, out_kernel_init=zero_init)
 
         self.downs = []
         self.ups = []
         num_resolutions = len(in_out)
 
-        for idx, (
-            (dim_in, dim_out),
-            layer_attn,
-            layer_heads,
-            layer_head_dim,
-        ) in enumerate(zip(*block_args)):
-            is_last = idx >= (num_resolutions - 1)
+        for idx, ((dim_in, dim_out), layer_attn, layer_heads, layer_head_dim) in enumerate(zip(*block_args)):
+            is_last = idx >= (num_resolutions-1)
 
             attn_block = Attention if layer_attn else nnx_attn
 
-            self.downs.append(
-                [
-                    resnet_block(dim_in, dim_in),
-                    resnet_block(dim_in, dim_in),
-                    (
-                        attn_block(dim_in, layer_heads, layer_head_dim)
-                        if layer_attn
-                        else attn_block(layer_heads, dim_in, dim_in)
-                    ),
-                    (
-                        downsample(dim_in, dim_out)
-                        if not is_last
-                        else nnx.Conv(dim_in, dim_out, (3, 3), padding=1, rngs=rngs)
-                    ),
-                ]
-            )
+            self.downs.append([
+                resnet_block(dim_in, dim_in), resnet_block(dim_in, dim_in),
+                attn_block(dim_in, layer_heads, layer_head_dim) if layer_attn else attn_block(layer_heads, dim_in, dim_in),
+                downsample(dim_in, dim_out) if not is_last else nnx.Conv(dim_in, dim_out, (3,3), padding=1, rngs=rngs, kernel_init=zero_init, bias_init=zero_init)
+            ])
 
         mid_dim = dims[-1]
-        self.mid_block_1 = ResBlock(mid_dim, mid_dim)
-        self.mid_attention = Attention(mid_dim, attn_heads[-1], attn_head_dim[-1])
-        self.mid_block_2 = ResBlock(mid_dim, mid_dim)
+        self.mid_block_1 = resnet_block(mid_dim, mid_dim)
+        self.mid_attention = nnx_attn(attn_heads[-1], mid_dim, mid_dim) #Attention(mid_dim, attn_heads[-1], attn_head_dim[-1])
+        self.mid_block_2 = resnet_block(mid_dim, mid_dim)
 
-        for idx, (
-            (dim_in, dim_out),
-            layer_attn,
-            layer_heads,
-            layer_head_dim,
-        ) in enumerate(zip(*map(reversed, block_args))):
+        # print(*map(reversed, block_args))
+
+        for idx, ((dim_in, dim_out), layer_attn, layer_heads, layer_head_dim) in enumerate(zip(*map(reversed, block_args))):
             is_last = idx == (len(in_out) - 1)
-            print(map(reversed, block_args))
 
             attn_block = Attention if layer_attn else nnx_attn
 
-            self.ups.append(
-                [
-                    resnet_block(dim_out + dim_in, dim_out, is_res=False),
-                    resnet_block(dim_out + dim_in, dim_out, is_res=False),
-                    (
-                        attn_block(dim_out, layer_heads, layer_head_dim)
-                        if layer_attn
-                        else attn_block(layer_heads, dim_out, dim_out)
-                    ),
-                    (
-                        upsample(dim_out, dim_in)
-                        if not is_last
-                        else nnx.Conv(dim_in, dim_out, (3, 3), padding=1, rngs=rngs)
-                    ),
-                ]
-            )
+            self.ups.append([
+                resnet_block(dim_out+dim_in, dim_out, is_res=False),
+                resnet_block(dim_out+dim_in, dim_out, is_res=False),
+                attn_block(dim_out, layer_heads, layer_head_dim) if layer_attn else attn_block(layer_heads, dim_out, dim_out),
+                upsample(dim_out, dim_in) if not is_last else nnx.Conv(dim_in, dim_out, (3,3), padding=1, rngs=rngs, )
+            ])
 
         default_out_dim = channels * (1 if not learn_var else 2)
         self.out_dim = out_dim or default_out_dim
 
-        self.finres_transform = res_conv(init_dim * 2, init_dim)
+        self.finres_transform = res_conv(init_dim*2, init_dim)
         self.final_resblock = resnet_block(init_dim, init_dim)
-        self.final_conv = nnx.Conv(
-            init_dim, self.out_dim, kernel_size=(1, 1), rngs=rngs
-        )
+        self.final_conv = nnx.Conv(init_dim, self.out_dim, kernel_size=(1, 1), rngs=rngs, kernel_init=xavier_init, bias_init=zero_init)
+
 
     def __call__(self, x: Array, t: Array, y: Array):
         x = self.init_conv(x)
@@ -431,7 +359,7 @@ class Unet(nnx.Module):
         x = self.mid_attention(x)
         x = self.mid_block_2(x, t)
 
-        # print(f'midblocks {x.shape}')
+        # print(f'midblocks {x[0]}')
 
         for block1, block2, attn, upsample_block in self.ups:
             # print(f'x preconcat {x.shape}')
@@ -456,7 +384,7 @@ class Unet(nnx.Module):
         # print(f'finres = {x.shape}')
         x = self.final_conv(x)
         # print(f'final {x.shape}')
-        return x
+        retu
 
 
 # wrapper for flow matching loss and sampling
@@ -500,11 +428,12 @@ class FlowMatch(nnx.Module):
         # Broadcast t_mid to match x_t's batch dimension
         t_mid = jnp.full((x_t.shape[0],), t_mid)
         # Evaluate the vector field at the midpoint
-        v_mid = self.model(x=x_t, y=cond, t=t_mid)
+        v_mid = self.model(x=x_t, t=t_mid, y=cond)
 
         # classifier-free guidance sampling
-        null_cond = jnp.zeros_like(cond)
-        v_uncond = self.model(x_t, null_cond, t_mid)
+        null_cond = jnp.zeros((cond.shape), dtype=jnp.int32)
+        # print(f'{cond = } / {null_cond = }')
+        v_uncond = self.model(x_t, t_mid, null_cond)
         v_mid = v_uncond + cfg_scale * (v_mid - v_uncond)
 
         # Update x_t using Euler's method
