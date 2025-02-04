@@ -452,3 +452,65 @@ class FlowMatch(nnx.Module):
             )
 
         return x_t / 0.13025
+
+
+# rectifed flow forward pass, loss, and smapling
+class RectFlowWrapper(nnx.Module):
+    def __init__(self, model: nnx.Module):
+        self.model = model
+
+    def __call__(self, x_input: Array, cond: Array):
+        b_size = x_input.shape[0]  # batch_size
+
+        rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
+        rand_t = nnx.sigmoid(rand)
+
+        inshape = [1] * len(x_input.shape[1:])
+        texp = rand_t.reshape([b_size, *(inshape)]).astype(jnp.bfloat16)
+
+        z_noise = jrand.uniform(randkey, x_input.shape).astype(
+            jnp.bfloat16
+        )  # input noise with same dim as image
+        z_noise_t = (1 - texp) * x_input + texp * z_noise
+
+        v_thetha = self.model(z_noise_t, rand_t, cond)
+        # print(f'{v_thetha.shape = }')
+
+        mean_dim = list(
+            range(1, len(x_input.shape))
+        )  # across all dimensions except the batch dim
+
+        mean_square = (z_noise - x_input - v_thetha) ** 2  # squared difference
+        loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
+        loss = jnp.mean(loss)  # mean loss
+
+        loss = loss.mean()
+
+        return loss
+
+    def sample(self, cond, sample_steps=50, cfg=2.0):
+        z_latent = jax.random.normal(randkey, (len(cond), 32, 32, 4)).astype(jnp.bfloat16)
+
+        b_size = z_latent.shape[0]
+        dt = 1.0 / sample_steps
+
+        dt = jnp.array([dt] * b_size)
+        dt = jnp.reshape(dt, shape=(b_size, *([1] * len(z_latent.shape[1:]))))
+
+        images = [z_latent]
+
+        for step in tqdm(range(sample_steps, 0, -1)):
+            t = step / sample_steps
+            t = jnp.array([t] * b_size).astype(jnp.bfloat16)
+
+            vcond = self.model(z_latent, t, cond, mask_ratio=0.0)
+
+            if cfg > 1.0:
+                null_cond = jnp.zeros_like(cond)
+                v_uncond = self.model(z_latent, t, null_cond)  # type: ignore
+                vcond = v_uncond + cfg * (vcond - v_uncond)
+
+            z_latent = z_latent - dt * vcond
+            images.append(z_latent)
+
+        return images[-1] / 0.13025
