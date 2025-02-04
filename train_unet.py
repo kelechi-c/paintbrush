@@ -9,7 +9,7 @@ from functools import partial
 from einops import rearrange
 from diffusers import AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 import matplotlib.pyplot as plt
 
@@ -62,6 +62,23 @@ flower_data = load_dataset("tensorkelechi/latent_flowers102", split="train")
 print("loaded vae")
 
 
+class FlowerImages(IterableDataset):
+    def __init__(self, dataset=flower_data, split=1000):
+        self.dataset = dataset.take(split)
+        self.split = split
+
+    def __len__(self):
+        return self.split
+
+    def __iter__(self):
+        for sample in self.dataset:
+
+            latent = jnp.array(sample["latents"], dtype=jnp.bfloat16)
+            label = jnp.array(sample["label"], dtype=jnp.int32)
+
+            yield {"latents": latent, "label": label}
+
+
 def jax_collate(batch):
     latents = jnp.stack(
         [jnp.array(item["latents"], dtype=jnp.bfloat16) for item in batch], axis=0
@@ -96,7 +113,7 @@ def device_get_model(model):
 
 def vae_decode(latent, vae=vae):
     tensor_img = rearrange(latent, "b h w c -> b c h w")
-    tensor_img = torch.from_numpy(np.array(tensor_img))
+    tensor_img = torch.from_numpy(np.array(tensor_img)).to(torch.bfloat16)
     x = vae.decode(tensor_img).sample
 
     img = VaeImageProcessor().postprocess(
@@ -104,7 +121,6 @@ def vae_decode(latent, vae=vae):
     )[0]
 
     return img
-
 
 def process_img(img):
     img = vae_decode(img[None])
@@ -132,6 +148,13 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
     plt.show()
 
     return file
+
+
+def inspect_latents(batch):
+    batch = [vae_decode(x) for x in batch]
+    file = "flowers-8.jpg"
+    gridfile = image_grid(batch, file)
+    print(f"sample saved @ {gridfile}")
 
 
 def sample_image_batch(step, model, labels):
@@ -179,7 +202,7 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
 
     batch = next(iter(train_loader))
 
-    # wandb_logger(key="yourkey", project_name="mini_diffusion")
+    wandb_logger(key="yourkey", project_name="mini_diffusion")
 
     stime = time.time()
 
@@ -203,9 +226,9 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
         )
 
         if epoch % 25 == 0:
-            gridfile, sample_error = sample_image_batch(epoch, model, batch)
+            gridfile = sample_image_batch(epoch, model, batch)
             image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log, "sample_error": sample_error})
+            wandb.log({"image_sample": image_log})
 
         jax.clear_caches()
         gc.collect()
@@ -223,7 +246,7 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
 @click.option("-bs", "--batch_size", default=64)
 def main(run, epochs, batch_size):
 
-    unet = Unet(dim=64)
+    unet = Unet(dim=128) # 128 => ~140M-size model
     model = FlowMatch(unet)
 
     n_params = sum([p.size for p in jax.tree.leaves(nnx.state(model))])
