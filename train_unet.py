@@ -17,7 +17,7 @@ import flax.traverse_util, pickle
 from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
 
-from diffunet import Unet, FlowMatch
+from diffunet import Unet, FlowMatch, RectFlowWrapper, MiniUnet
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -32,11 +32,6 @@ XLA_PYTHON_CLIENT_MEM_FRACTION = 0.20
 class config:
     seed = 333
     batch_size = 128
-    data_split = 10000
-    img_size = 32
-    patch_size = (2, 2)
-    lr = 2e-4
-    cfg_scale = 2.0
     vaescale_factor = 0.13025
 
 
@@ -61,7 +56,6 @@ vae = AutoencoderKL.from_pretrained(
 flower_data = load_dataset("tensorkelechi/latent_flowers102", split="train")
 print("loaded vae")
 
-
 class FlowerImages(IterableDataset):
     def __init__(self, dataset=flower_data, split=1000):
         self.dataset = dataset.take(split)
@@ -75,16 +69,16 @@ class FlowerImages(IterableDataset):
 
             latent = jnp.array(sample["latents"], dtype=jnp.bfloat16)
             label = jnp.array(sample["label"], dtype=jnp.int32)
-
-            yield {"latents": latent, "label": label}
+            
+            yield {'latents': latent, 'label': label}
 
 
 def jax_collate(batch):
     latents = jnp.stack(
-        [jnp.array(item["latents"], dtype=jnp.bfloat16) for item in batch], axis=0
+        [item["latents"] for item in batch], axis=0
     )
     labels = jnp.stack(
-        [jnp.array(int(item["label"]), dtype=jnp.int32) for item in batch], axis=0
+        [item["label"] for item in batch], axis=0
     )
 
     return {
@@ -111,16 +105,27 @@ def device_get_model(model):
     return model
 
 
+
+from PIL import Image as pillow
+
 def vae_decode(latent, vae=vae):
     tensor_img = rearrange(latent, "b h w c -> b c h w")
     tensor_img = torch.from_numpy(np.array(tensor_img)).to(torch.bfloat16)
-    x = vae.decode(tensor_img).sample
+    x = vae.decode(tensor_img / 0.13025).sample
+    # print(x.shape)
+    img = x[0].detach()# * 0.5 + 0.5
+    img = torch.clip(img, 0, 1)
 
-    img = VaeImageProcessor().postprocess(
-        image=x.detach(), do_denormalize=[True, True]
-    )[0]
+    img = np.array(img.to(torch.float32)).transpose(1, 2, 0) * 255
+    # print(f'2 {img.shape = }')
+    
+    img = pillow.fromarray(img.astype(np.uint8))
 
     return img
+
+# def process(img):
+#     img = vae_decode(img[None])[0]
+#     return img
 
 def process_img(img):
     img = vae_decode(img[None])
@@ -150,18 +155,12 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
     return file
 
 
-def inspect_latents(batch):
-    batch = [vae_decode(x) for x in batch]
-    file = "flowers-8.jpg"
-    gridfile = image_grid(batch, file)
-    print(f"sample saved @ {gridfile}")
-
-
-def sample_image_batch(step, model, labels):
+def sample_image_batch(step, model, batch):
     pred_model = device_get_model(model)
     pred_model.eval()
 
-    image_batch = pred_model.sample(labels)
+    # print(f"label {batch['label']}")
+    image_batch = pred_model.sample(batch['label'])
     file = f"fmsamples/{step}_flowdit.png"
     batch = [process_img(x) for x in image_batch]
 
@@ -182,7 +181,7 @@ def train_step(model, optimizer, batch):
 
     def loss_func(model, batch):
         img_latents, label = batch["latent"], batch["label"]
-        img_latents = rearrange(img_latents, "b c h w -> b h w c") * 0.13025
+        img_latents = rearrange(img_latents * 0.13025, "b c h w -> b h w c")
         loss = model(img_latents, label)
 
         return loss
@@ -201,8 +200,9 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
     model.train()
 
     batch = next(iter(train_loader))
+    
 
-    wandb_logger(key="yourkey", project_name="mini_diffusion")
+    wandb_logger(key="", project_name="mini_diffusion")
 
     stime = time.time()
 
@@ -218,7 +218,7 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
         wandb.log(
             {
                 "loss": train_loss.item(),
-                "log_loss": math.log10(train_loss.item() + 1e-8),
+                "log_losks": math.log10(train_loss.item() + 1e-8),
                 "grad_norm": grad_norm.item(),
                 "log_grad_norm": math.log10(grad_norm.item() + 1e-8),
                 "lr": lr,
@@ -239,14 +239,20 @@ def batch_trainer(epochs, model, optimizer, train_loader, schedule):
     )
     return model, train_loss
 
+def inspect_latents(batch):
+    batch = [process_img(x) for x in batch]
+    file = "flowers-8.png"
+    gridfile = image_grid(batch, file)
+    print(f"input sample saved @ {gridfile}")
+
 
 @click.command()
 @click.option("-r", "--run", default="single_batch")
-@click.option("-e", "--epochs", default=50)
-@click.option("-bs", "--batch_size", default=64)
+@click.option("-e", "--epochs", default=100)
+@click.option("-bs", "--batch_size", default=16)
 def main(run, epochs, batch_size):
 
-    unet = Unet(dim=128) # 128 => ~140M-size model
+    unet = MiniUnet(dim=512) #Unet(dim=128)
     model = FlowMatch(unet)
 
     n_params = sum([p.size for p in jax.tree.leaves(nnx.state(model))])
@@ -263,17 +269,19 @@ def main(run, epochs, batch_size):
     #     transition_steps=5000,
     # )
 
-    schedule = optax.constant_schedule(2e-4)
+    schedule = optax.constant_schedule(5e-4)
 
     optimizer = nnx.Optimizer(
         model,
-        optax.adamw(schedule, b1=0.9, b2=0.995, eps=1e-8, weight_decay=0.001),
+        optax.adamw(schedule, b1=0.9, b2=0.995, eps=1e-8, weight_decay=0.0001),
         # optax.chain(
         #     optax.clip_by_global_norm(1.0),
         # ),
     )
+    
+    dataset = FlowerImages()
     train_loader = DataLoader(
-        flower_data,
+        dataset,
         batch_size=batch_size,
         num_workers=0,
         drop_last=True,
@@ -282,6 +290,10 @@ def main(run, epochs, batch_size):
 
     sp = next(iter(train_loader))
     print(f"loaded data \n data sample: {sp['latent'].shape}")
+    
+    # data_sample = sp['latent'].astype(jnp.float32)
+    # data_sample = rearrange(data_sample * 0.13025, "b c h w -> b h w c")
+    # inspect_latents(data_sample)
 
     if run == "single_batch":
         model, loss = batch_trainer(
