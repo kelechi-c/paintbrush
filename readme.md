@@ -1,10 +1,9 @@
 ### paintbrush 🖌️🎨
 experiments, random code/files related to diffusion models/image generation. 
-Will try my best to keep stuff I do documented in [notes.md](notes.md).
 
 #### progress
 - [2025-02-01] - [processed oxford-flowers](https://huggingface.co/datasets/tensorkelechi/latent_flowers102) dataset(vae encoding) for quick testing/experiments.
-- [2025-02-_] - 
+- [2025-02-8] - simple DiT model (and [**single file training code**](./ditflower.py) for flower images)
  
 
 #### credits
