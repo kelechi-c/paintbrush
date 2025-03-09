@@ -3,10 +3,13 @@ from flax import nnx
 from jax import Array, numpy as jnp
 from typing import Optional, Callable
 
+class play_config:
+    
 
 class sana_config:
     name = "SanaTransformer2DModel"
     channels = 32
+    dim = 1152
     cross_attn_dim = 1152
     cross_attn_heads = 16
     attn_heads = 36
@@ -76,6 +79,7 @@ class SanaModulatedNorm(nnx.Module):
 class Attention(nnx.Module):
     def __init__(
         self,
+        config: sana_config,
         query_dim: int,
         cross_attention_dim: Optional[int] = None,
         heads: int = 8,
@@ -91,13 +95,14 @@ class Attention(nnx.Module):
         eps: float = 1e-5,
         rescale_output_factor: float = 1.0,
         residual_connection: bool = False,
-        processor: Optional["AttnProcessor"] = None,
+        processor = None,
         out_dim: int = None,
         rngs=nnx.Rngs(0),
         elementwise_affine: bool = True,
     ):
         super().__init__()
-
+        
+        self.config = config
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
         self.use_bias = bias
@@ -159,7 +164,6 @@ class Attention(nnx.Module):
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
         )
-        
 
 
 from torch.nn import functional as F
@@ -170,111 +174,87 @@ class SanaLinearAttnProcessor2_0:
     """
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: Array,
-        encoder_hidden_states = None,
-        attention_mask = None,
-    ) -> Array:
-
+        self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None
+    ):
+        # Save the original data type to cast back at the end.
         original_dtype = hidden_states.dtype
 
+        # If no encoder hidden states are provided, use the hidden_states for keys and values.
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
+        # Compute projections using the provided attention module.
         query = attn.to_q(hidden_states)
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query = query.transpose(1, 2).reshape(1, (sana_config.attn_heads, -1))
-        key = key.transpose(1, 2).unflatten(1, (attn.heads, -1)).transpose(2, 3)
-        value = value.transpose(1, 2).unflatten(1, (attn.heads, -1))
+        # Assume query, key, value have shape [batch, seq_len, total_dim]
+        # and that total_dim = attn.heads * head_dim.
+        batch_size, seq_len, total_dim = query.shape
+        heads = attn.heads
+        head_dim = total_dim // heads
 
-        # query = F.relu(query)
-        # key = F.relu(key)
+        # Reshape projections for multi-head attention.
+        # For query: reshape from [B, S, total_dim] -> [B, heads, head_dim, S]
+        query = jnp.transpose(query, (0, 2, 1))
+        query = query.reshape(batch_size, heads, head_dim, seq_len)
 
-        query = nnx.relu(query)
-        key = nnx.relu(key)
+        # For key: reshape from [B, S, total_dim] -> [B, heads, head_dim, S] then transpose to [B, heads, S, head_dim]
+        key = jnp.transpose(key, (0, 2, 1))
+        key = key.reshape(batch_size, heads, head_dim, seq_len)
+        key = jnp.transpose(key, (0, 1, 3, 2))
 
-        # query, key, value = query.float(), key.float(), value.float()
+        # For value: reshape from [B, S, total_dim] -> [B, heads, head_dim, S]
+        value = jnp.transpose(value, (0, 2, 1))
+        value = value.reshape(batch_size, heads, head_dim, seq_len)
 
-        # value = F.pad(value, (0, 0, 0, 1), mode="constant", value=1.0)
-        value = jnp.pad(value, pad_width=[0, 0, 0, 1], mode='constant')
-        
+        # Apply ReLU activation to query and key.
+        query = jax.nn.relu(query)
+        key = jax.nn.relu(key)
+
+        # Cast to float32 for numerical stability.
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+        value = value.astype(jnp.float32)
+
+        # Pad the value tensor along the head_dim axis (axis=2) with one extra row of constant 1.0.
+        # This changes its shape from [B, heads, head_dim, S] to [B, heads, head_dim+1, S].
+        value = jnp.pad(
+            value,
+            ((0, 0), (0, 0), (0, 1), (0, 0)),
+            mode="constant",
+            constant_values=1.0,
+        )
+
+        # Compute the attention scores.
+        # First, multiply value and key: shapes [B, heads, head_dim+1, S] x [B, heads, S, head_dim] -> [B, heads, head_dim+1, head_dim]
         scores = jnp.matmul(value, key)
+        # Next, multiply the scores by the query: [B, heads, head_dim+1, head_dim] x [B, heads, head_dim, S] -> [B, heads, head_dim+1, S]
         hidden_states = jnp.matmul(scores, query)
 
-        hidden_states = hidden_states[:, :, :-1] / (hidden_states[:, :, -1:] + 1e-15)
-        hidden_states = hidden_states.flatten(1, 2).transpose(1, 2)
+        # The last element along axis=2 acts as a normalization term.
+        # Divide the first head_dim elements by the normalization term (with a small constant for stability).
+        numerator = hidden_states[:, :, :-1, :]
+        denominator = hidden_states[:, :, -1:, :] + 1e-15
+        hidden_states = numerator / denominator
+
+        # Reshape back to [B, S, total_dim]:
+        # First, combine the heads and head_dim dimensions.
+        hidden_states = hidden_states.reshape(batch_size, heads * head_dim, seq_len)
+        # Then transpose to [B, S, total_dim].
+        hidden_states = jnp.transpose(hidden_states, (0, 2, 1))
         hidden_states = hidden_states.astype(original_dtype)
 
+        # Apply final output projections.
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
 
+        # If using float16, clip the output to the valid representable range.
         if original_dtype == jnp.float16:
-            hidden_states = hidden_states.clip(-65504, 65504)
+            hidden_states = jnp.clip(hidden_states, -65504, 65504)
 
         return hidden_states
 
-
-class AttnProcessor:
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: Array,
-        encoder_hidden_states: Optional[Array] = None,
-        attention_mask: Optional[Array] = None,
-    ) -> Array:
-        residual = hidden_states
-
-        input_ndim = hidden_states.ndim
-
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 1))
-            hidden_states = hidden_states.reshape(batch_size, height * width, channel)
-
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-        if attention_mask is not None:
-            attention_mask = attention_mask.astype(jnp.float32)
-
-        if attn.group_norm is not None:
-          hidden_states = jnp.transpose(hidden_states, (0, 2, 1))
-          hidden_states = attn.group_norm(hidden_states)
-          hidden_states = jnp.transpose(hidden_states, (0, 2, 1))
-
-        query = attn.to_q(hidden_states)
-
-        if encoder_hidden_states is None:
-            key = attn.to_k(hidden_states)
-            value = attn.to_v(hidden_states)
-        else:
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
-
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-
-        hidden_states = jnp.einsum("bqk,bkd->bqd", attention_probs, value)
-        hidden_states = hidden_states.reshape((hidden_states.shape[0] // attn.heads, attn.heads, hidden_states.shape[1], hidden_states.shape[-1]))
-        hidden_states = jnp.transpose(hidden_states, (0, 2, 1, 3)).reshape(hidden_states.shape[0] // attn.heads,hidden_states.shape[1],-1)
-
-        hidden_states = attn.to_out(hidden_states)
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-
-        return hidden_states
 
 # jnp.pad()
 
@@ -304,8 +284,9 @@ class SanaTransformerBlock(nnx.Module):
 
     def __init__(
         self,
-        dim: int = 2240,
-        num_attention_heads: int = 70,
+        config = sana_config,
+        dim: int = 1152,
+        num_attention_heads: int = 36,
         attention_head_dim: int = 32,
         dropout: float = 0.0,
         num_cross_attention_heads: Optional[int] = 20,
@@ -324,14 +305,11 @@ class SanaTransformerBlock(nnx.Module):
         self.norm1 = nnx.LayerNorm(
             dim, elementwise_affine=False, epsilon=norm_eps, rngs=rngs
         )
-        self.attn1 = nnx.MultiHeadAttention(
-            num_heads=num_attention_heads,
-            in_features=dim,
-            features_per_head=attention_head_dim,
-            dropout_rate=dropout,
-            use_bias=attention_bias,
-            out_bias=attention_out_bias,
-            rngs=rngs,
+        self.attn1 = Attention(
+            sana_config, 
+            query_dim=dim, cross_attention_dim=config.cross_attn_dim, 
+            heads=config.attn_heads, dim_head=config.attn_head_dim,
+            processor=SanaLinearAttnProcessor2_0
         )
 
         # 2. Cross Attention
@@ -379,7 +357,7 @@ class SanaTransformerBlock(nnx.Module):
 
         # 1. Modulation
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
-            self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1),
+            self.scale_shift_table.value[None] + timestep.reshape(batch_size, 6, -1),
             6,
             axis=1,
         )
